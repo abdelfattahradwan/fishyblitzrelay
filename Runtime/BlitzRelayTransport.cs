@@ -30,11 +30,6 @@ namespace BlitzRelay
 
 		private string _roomHostToken = string.Empty;
 
-		[Header("Misc")]
-		[SerializeField]
-		[Tooltip("True to stop local server and client sockets using a new thread.")]
-		private bool stopSocketsOnThread;
-
 		[Tooltip("While true, forces sockets to send data directly to interface without routing.")]
 		[SerializeField]
 		private bool doNotRoute;
@@ -89,11 +84,6 @@ namespace BlitzRelay
 		public bool IsRelayHostAvailable
 		{
 			get => _relayHostAvailable;
-		}
-
-		internal bool StopSocketsOnThread
-		{
-			get => stopSocketsOnThread;
 		}
 
 		internal bool DoNotRoute

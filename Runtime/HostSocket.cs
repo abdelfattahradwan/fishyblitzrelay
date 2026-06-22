@@ -173,24 +173,44 @@ namespace BlitzRelay
 
 				DeliveryMethod deliveryMethod = gameChannel == (byte)Channel.Reliable ? DeliveryMethod.ReliableOrdered : DeliveryMethod.Unreliable;
 
-				if (gameChannel == (byte)Channel.Unreliable && segment.Count > Mtu)
-				{
-					Transport.NetworkManager.LogWarning($"Server is sending {segment.Count} bytes on the unreliable channel, while the MTU is only {Mtu}. Channel changed to reliable for this send.");
-
-					deliveryMethod = DeliveryMethod.ReliableOrdered;
-				}
-
 				int frameSize = MessageCodec.HostDataHeaderSize + segment.Count;
 
-				byte[] frameBuffer = ArrayPool<byte>.Shared.Rent(frameSize);
+				int maxSinglePacketSize = RelayPeer.GetMaxSinglePacketSize(deliveryMethod);
 
 				int targetId = connectionId == NetworkConnection.UNSET_CLIENTID_VALUE ? (int)VirtualClientTarget.Broadcast : connectionId;
 
-				int written = MessageCodec.WriteHostData(frameBuffer, targetId, gameChannel, segment);
+				if (frameSize > maxSinglePacketSize)
+				{
+					if (deliveryMethod == DeliveryMethod.Unreliable)
+					{
+						outgoingDataPacket.Dispose();
 
-				RelayPeer.Send(frameBuffer, 0, written, deliveryMethod);
+						continue;
+					}
 
-				ArrayPool<byte>.Shared.Return(frameBuffer);
+					byte[] frameBuffer = ArrayPool<byte>.Shared.Rent(frameSize);
+
+					try
+					{
+						int fragmentedFrameBytes = MessageCodec.WriteHostData(frameBuffer, targetId, gameChannel, segment);
+
+						RelayPeer.Send(frameBuffer, 0, fragmentedFrameBytes, MessageCodec.RelayWireChannel, deliveryMethod);
+					}
+					finally
+					{
+						ArrayPool<byte>.Shared.Return(frameBuffer);
+					}
+
+					outgoingDataPacket.Dispose();
+
+					continue;
+				}
+
+				PooledPacket pooledPacket = RelayPeer.CreatePacketFromPool(deliveryMethod, MessageCodec.RelayWireChannel);
+
+				int written = MessageCodec.WriteHostData(pooledPacket.Data.AsSpan(pooledPacket.UserDataOffset, frameSize), targetId, gameChannel, segment);
+
+				RelayPeer.SendPooledPacket(pooledPacket, written);
 
 				outgoingDataPacket.Dispose();
 			}
@@ -360,7 +380,7 @@ namespace BlitzRelay
 						}
 						else
 						{
-							byte[] payloadData = ArrayPool<byte>.Shared.Rent(Math.Max(gamePayload.Length, Mtu));
+							byte[] payloadData = ArrayPool<byte>.Shared.Rent(gamePayload.Length);
 
 							gamePayload.CopyTo(payloadData.AsSpan(0, gamePayload.Length));
 

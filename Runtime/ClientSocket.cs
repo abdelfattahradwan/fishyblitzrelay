@@ -120,22 +120,42 @@ namespace BlitzRelay
 
 				DeliveryMethod deliveryMethod = gameChannel == (byte)Channel.Reliable ? DeliveryMethod.ReliableOrdered : DeliveryMethod.Unreliable;
 
-				if (gameChannel == (byte)Channel.Unreliable && outgoingPacketSegment.Count > Mtu)
-				{
-					Transport.NetworkManager.LogWarning($"Client is sending {outgoingPacketSegment.Count} bytes on the unreliable channel, while the MTU is only {Mtu}. Channel changed to reliable for this send.");
-
-					deliveryMethod = DeliveryMethod.ReliableOrdered;
-				}
-
 				int frameSize = MessageCodec.ClientDataHeaderSize + outgoingPacketSegment.Count;
 
-				byte[] frameBuffer = ArrayPool<byte>.Shared.Rent(frameSize);
+				int maxSinglePacketSize = RelayPeer.GetMaxSinglePacketSize(deliveryMethod);
 
-				int written = MessageCodec.WriteClientData(frameBuffer, gameChannel, outgoingPacketSegment);
+				if (frameSize > maxSinglePacketSize)
+				{
+					if (deliveryMethod == DeliveryMethod.Unreliable)
+					{
+						outgoingDataPacket.Dispose();
 
-				RelayPeer.Send(frameBuffer, 0, written, deliveryMethod);
+						continue;
+					}
 
-				ArrayPool<byte>.Shared.Return(frameBuffer);
+					byte[] frameBuffer = ArrayPool<byte>.Shared.Rent(frameSize);
+
+					try
+					{
+						int fragmentedFrameBytes = MessageCodec.WriteClientData(frameBuffer, gameChannel, outgoingPacketSegment);
+
+						RelayPeer.Send(frameBuffer, 0, fragmentedFrameBytes, MessageCodec.RelayWireChannel, deliveryMethod);
+					}
+					finally
+					{
+						ArrayPool<byte>.Shared.Return(frameBuffer);
+					}
+
+					outgoingDataPacket.Dispose();
+
+					continue;
+				}
+
+				PooledPacket pooledPacket = RelayPeer.CreatePacketFromPool(deliveryMethod, MessageCodec.RelayWireChannel);
+
+				int written = MessageCodec.WriteClientData(pooledPacket.Data.AsSpan(pooledPacket.UserDataOffset, frameSize), gameChannel, outgoingPacketSegment);
+
+				RelayPeer.SendPooledPacket(pooledPacket, written);
 
 				outgoingDataPacket.Dispose();
 			}
@@ -246,7 +266,7 @@ namespace BlitzRelay
 					{
 						MessageCodec.ReadClientData(relayPayload, out byte gameChannel, out ReadOnlySpan<byte> gamePayload);
 
-						byte[] payloadData = ArrayPool<byte>.Shared.Rent(Math.Max(gamePayload.Length, Mtu));
+						byte[] payloadData = ArrayPool<byte>.Shared.Rent(gamePayload.Length);
 
 						gamePayload.CopyTo(payloadData.AsSpan(0, gamePayload.Length));
 

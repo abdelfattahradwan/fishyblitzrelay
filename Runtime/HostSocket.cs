@@ -244,6 +244,8 @@ namespace BlitzRelay
 
 			SocketNetManager = new NetManager(listener, PacketLayer)
 			{
+				DisconnectTimeout = DisconnectTimeoutMilliseconds,
+
 				DontRoute = Transport.DoNotRoute,
 
 				MtuOverride = Mtu,
@@ -278,132 +280,111 @@ namespace BlitzRelay
 
 		private void NetworkReceiveEventHandler(NetPeer fromPeer, NetPacketReader reader, byte channel, DeliveryMethod deliveryMethod)
 		{
-			int dataLength = reader.AvailableBytes;
-
-			if (dataLength < 1)
+			try
 			{
-				reader.Recycle();
+				int dataLength = reader.UserDataSize;
 
-				return;
-			}
+				if (dataLength < 1) return;
 
-			byte[] rawData = ArrayPool<byte>.Shared.Rent(Math.Max(dataLength, Mtu));
+				ReadOnlySpan<byte> relayPayload = new(reader.RawData, reader.UserDataOffset, dataLength);
 
-			reader.GetBytes(rawData, dataLength);
+				MessageType messageType = MessageCodec.ReadMessageType(relayPayload);
 
-			reader.Recycle();
-
-			MessageType messageType = MessageCodec.ReadMessageType(rawData);
-
-			switch (messageType)
-			{
-				case MessageType.RoomCreated:
+				switch (messageType)
 				{
-					MessageCodec.ReadRoomCreated(rawData, out string roomCode, out string roomHostToken);
-
-					Transport.SetRoomCode(roomCode);
-
-					Transport.SetRoomHostToken(roomHostToken);
-
-					Transport.HandleRelayHostAvailability(true);
-
-					ConnectionStateChanges.Enqueue(LocalConnectionState.Started);
-
-					ArrayPool<byte>.Shared.Return(rawData);
-
-					break;
-				}
-
-				case MessageType.Connected:
-				{
-					int virtualId = MessageCodec.ReadConnected(rawData);
-
-					ArrayPool<byte>.Shared.Return(rawData);
-
-					if (_virtualClients.Count >= _maximumClients)
+					case MessageType.RoomCreated:
 					{
-						byte[] kickMessage = MessageCodec.CreateKick(virtualId);
+						MessageCodec.ReadRoomCreated(relayPayload, out string roomCode, out string roomHostToken);
 
-						RelayPeer?.Send(kickMessage, 0, kickMessage.Length, DeliveryMethod.ReliableOrdered);
+						Transport.SetRoomCode(roomCode);
+
+						Transport.SetRoomHostToken(roomHostToken);
+
+						Transport.HandleRelayHostAvailability(true);
+
+						ConnectionStateChanges.Enqueue(LocalConnectionState.Started);
 
 						break;
 					}
 
-					_virtualClients.Add(virtualId);
-
-					RemoteConnectionChange remoteConnectionChange = new(virtualId, true);
-
-					_remoteConnectionChanges.Enqueue(remoteConnectionChange);
-
-					break;
-				}
-
-				case MessageType.Disconnected:
-				{
-					int virtualId = MessageCodec.ReadDisconnected(rawData);
-
-					ArrayPool<byte>.Shared.Return(rawData);
-
-					_virtualClients.Remove(virtualId);
-
-					RemoteConnectionChange remoteConnectionChange = new(virtualId, false);
-
-					_remoteConnectionChanges.Enqueue(remoteConnectionChange);
-
-					break;
-				}
-
-				case MessageType.Data:
-				{
-					MessageCodec.ReadHostData(rawData, dataLength, out int sourceVirtualId, out byte gameChannel, out int payloadOffset, out int payloadLength);
-
-					if (payloadLength > Mtu)
+					case MessageType.Connected:
 					{
-						_virtualClients.Remove(sourceVirtualId);
+						int virtualId = MessageCodec.ReadConnected(relayPayload);
 
-						RemoteConnectionChange remoteConnectionChange = new(sourceVirtualId, false);
+						if (_virtualClients.Count >= _maximumClients)
+						{
+							byte[] kickMessage = MessageCodec.CreateKick(virtualId);
+
+							RelayPeer?.Send(kickMessage, 0, kickMessage.Length, DeliveryMethod.ReliableOrdered);
+
+							break;
+						}
+
+						_virtualClients.Add(virtualId);
+
+						RemoteConnectionChange remoteConnectionChange = new(virtualId, true);
 
 						_remoteConnectionChanges.Enqueue(remoteConnectionChange);
 
-						byte[] kickMessage = MessageCodec.CreateKick(sourceVirtualId);
-
-						RelayPeer?.Send(kickMessage, 0, kickMessage.Length, DeliveryMethod.ReliableOrdered);
-
-						ArrayPool<byte>.Shared.Return(rawData);
+						break;
 					}
-					else
+
+					case MessageType.Disconnected:
 					{
-						byte[] payloadData = ArrayPool<byte>.Shared.Rent(Math.Max(payloadLength, Mtu));
+						int virtualId = MessageCodec.ReadDisconnected(relayPayload);
 
-						Buffer.BlockCopy(rawData, payloadOffset, payloadData, 0, payloadLength);
+						_virtualClients.Remove(virtualId);
 
-						ArrayPool<byte>.Shared.Return(rawData);
+						RemoteConnectionChange remoteConnectionChange = new(virtualId, false);
 
-						IncomingPackets.Enqueue(DataPacket.TakeRentedBuffer(sourceVirtualId, payloadData, payloadLength, gameChannel));
+						_remoteConnectionChanges.Enqueue(remoteConnectionChange);
+
+						break;
 					}
 
-					break;
+					case MessageType.Data:
+					{
+						MessageCodec.ReadHostData(relayPayload, out int sourceVirtualId, out byte gameChannel, out ReadOnlySpan<byte> gamePayload);
+
+						if (gamePayload.Length > Mtu)
+						{
+							_virtualClients.Remove(sourceVirtualId);
+
+							RemoteConnectionChange remoteConnectionChange = new(sourceVirtualId, false);
+
+							_remoteConnectionChanges.Enqueue(remoteConnectionChange);
+
+							byte[] kickMessage = MessageCodec.CreateKick(sourceVirtualId);
+
+							RelayPeer?.Send(kickMessage, 0, kickMessage.Length, DeliveryMethod.ReliableOrdered);
+						}
+						else
+						{
+							byte[] payloadData = ArrayPool<byte>.Shared.Rent(Math.Max(gamePayload.Length, Mtu));
+
+							gamePayload.CopyTo(payloadData.AsSpan(0, gamePayload.Length));
+
+							IncomingPackets.Enqueue(DataPacket.TakeRentedBuffer(sourceVirtualId, payloadData, gamePayload.Length, gameChannel));
+						}
+
+						break;
+					}
+
+					case MessageType.Error:
+					{
+						ErrorCode errorCode = MessageCodec.ReadError(relayPayload);
+
+						Transport.NetworkManager.LogError($"Relay returned error code {errorCode}.");
+
+						StopConnection();
+
+						break;
+					}
 				}
-
-				case MessageType.Error:
-				{
-					ErrorCode errorCode = MessageCodec.ReadError(rawData);
-
-					ArrayPool<byte>.Shared.Return(rawData);
-
-					Transport.NetworkManager.LogError($"Relay returned error code {errorCode}.");
-
-					StopConnection();
-
-					break;
-				}
-
-				default:
-				{
-					ArrayPool<byte>.Shared.Return(rawData);
-
-					break;
-				}
+			}
+			finally
+			{
+				reader.Recycle();
 			}
 		}
 

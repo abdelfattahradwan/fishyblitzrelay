@@ -158,6 +158,8 @@ namespace BlitzRelay
 
 			SocketNetManager = new NetManager(listener, PacketLayer)
 			{
+				DisconnectTimeout = DisconnectTimeoutMilliseconds,
+
 				DontRoute = Transport.DoNotRoute,
 
 				MtuOverride = Mtu,
@@ -188,120 +190,97 @@ namespace BlitzRelay
 
 		private void NetworkReceiveEventHandler(NetPeer fromPeer, NetPacketReader reader, byte channel, DeliveryMethod deliveryMethod)
 		{
-			int dataLen = reader.AvailableBytes;
+			try
+			{
+				int dataLength = reader.UserDataSize;
 
-			if (dataLen < 1)
+				if (dataLength < 1) return;
+
+				ReadOnlySpan<byte> relayPayload = new(reader.RawData, reader.UserDataOffset, dataLength);
+
+				MessageType messageType = MessageCodec.ReadMessageType(relayPayload);
+
+				switch (messageType)
+				{
+					case MessageType.JoinSuccess:
+					{
+						Transport.HandleRelayHostAvailability(true);
+
+						ConnectionStateChanges.Enqueue(LocalConnectionState.Started);
+
+						break;
+					}
+
+					case MessageType.HostPromoted:
+					{
+						MessageCodec.ReadHostPromoted(relayPayload, out string roomCode, out int maximumClients, out string claimToken);
+
+						Transport.HandleRelayHostAvailability(false);
+
+						Transport.HandleClientHostPromoted(roomCode, maximumClients, claimToken);
+
+						_pendingPromotionDisconnect = true;
+
+						byte[] acknowledgement = MessageCodec.CreateHostPromotionAck(roomCode, claimToken);
+
+						fromPeer.Send(acknowledgement, 0, acknowledgement.Length, DeliveryMethod.ReliableOrdered);
+
+						break;
+					}
+
+					case MessageType.HostUnavailable:
+					{
+						Transport.HandleRelayHostAvailability(false);
+
+						break;
+					}
+
+					case MessageType.HostAvailable:
+					{
+						Transport.HandleRelayHostAvailability(true);
+
+						break;
+					}
+
+					case MessageType.Data:
+					{
+						MessageCodec.ReadClientData(relayPayload, out byte gameChannel, out ReadOnlySpan<byte> gamePayload);
+
+						byte[] payloadData = ArrayPool<byte>.Shared.Rent(Math.Max(gamePayload.Length, Mtu));
+
+						gamePayload.CopyTo(payloadData.AsSpan(0, gamePayload.Length));
+
+						IncomingPackets.Enqueue(DataPacket.TakeRentedBuffer(0, payloadData, gamePayload.Length, gameChannel));
+
+						break;
+					}
+
+					case MessageType.Disconnected:
+					{
+						_pendingPromotionDisconnect = false;
+
+						StopConnection();
+
+						break;
+					}
+
+					case MessageType.Error:
+					{
+						ErrorCode errorCode = MessageCodec.ReadError(relayPayload);
+
+						_pendingPromotionDisconnect = false;
+
+						Transport.NetworkManager.LogError($"Relay returned error code {errorCode}.");
+
+						StopConnection();
+
+						break;
+					}
+				}
+			}
+			finally
 			{
 				reader.Recycle();
-
-				return;
-			}
-
-			byte[] rawData = ArrayPool<byte>.Shared.Rent(Math.Max(dataLen, Mtu));
-
-			reader.GetBytes(rawData, dataLen);
-
-			reader.Recycle();
-
-			MessageType messageType = MessageCodec.ReadMessageType(rawData);
-
-			switch (messageType)
-			{
-				case MessageType.JoinSuccess:
-				{
-					Transport.HandleRelayHostAvailability(true);
-
-					ConnectionStateChanges.Enqueue(LocalConnectionState.Started);
-
-					ArrayPool<byte>.Shared.Return(rawData);
-
-					break;
-				}
-
-				case MessageType.HostPromoted:
-				{
-					MessageCodec.ReadHostPromoted(rawData, out string roomCode, out int maximumClients, out string claimToken);
-
-					ArrayPool<byte>.Shared.Return(rawData);
-
-					Transport.HandleRelayHostAvailability(false);
-
-					Transport.HandleClientHostPromoted(roomCode, maximumClients, claimToken);
-
-					_pendingPromotionDisconnect = true;
-
-					byte[] acknowledgement = MessageCodec.CreateHostPromotionAck(roomCode, claimToken);
-
-					fromPeer.Send(acknowledgement, 0, acknowledgement.Length, DeliveryMethod.ReliableOrdered);
-
-					break;
-				}
-
-				case MessageType.HostUnavailable:
-				{
-					ArrayPool<byte>.Shared.Return(rawData);
-
-					Transport.HandleRelayHostAvailability(false);
-
-					break;
-				}
-
-				case MessageType.HostAvailable:
-				{
-					ArrayPool<byte>.Shared.Return(rawData);
-
-					Transport.HandleRelayHostAvailability(true);
-
-					break;
-				}
-
-				case MessageType.Data:
-				{
-					MessageCodec.ReadClientData(rawData, dataLen, out byte gameChannel, out int payloadOffset, out int payloadLength);
-
-					byte[] payloadData = ArrayPool<byte>.Shared.Rent(Math.Max(payloadLength, Mtu));
-
-					Buffer.BlockCopy(rawData, payloadOffset, payloadData, 0, payloadLength);
-
-					ArrayPool<byte>.Shared.Return(rawData);
-
-					IncomingPackets.Enqueue(DataPacket.TakeRentedBuffer(0, payloadData, payloadLength, gameChannel));
-
-					break;
-				}
-
-				case MessageType.Disconnected:
-				{
-					ArrayPool<byte>.Shared.Return(rawData);
-
-					_pendingPromotionDisconnect = false;
-
-					StopConnection();
-
-					break;
-				}
-
-				case MessageType.Error:
-				{
-					ErrorCode errorCode = MessageCodec.ReadError(rawData);
-
-					ArrayPool<byte>.Shared.Return(rawData);
-
-					_pendingPromotionDisconnect = false;
-
-					Transport.NetworkManager.LogError($"Relay returned error code {errorCode}.");
-
-					StopConnection();
-
-					break;
-				}
-
-				default:
-				{
-					ArrayPool<byte>.Shared.Return(rawData);
-
-					break;
-				}
 			}
 		}
 	}

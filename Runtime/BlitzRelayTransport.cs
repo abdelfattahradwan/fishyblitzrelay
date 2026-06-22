@@ -215,7 +215,7 @@ namespace BlitzRelay
 
 		public override float GetTimeout(bool asServer)
 		{
-			return MaxTimeoutSeconds;
+			return asServer ? _serverTimeout : _clientTimeout;
 		}
 
 		public override void SetTimeout(float value, bool asServer)
@@ -487,9 +487,9 @@ namespace BlitzRelay
 
 		private void UpdateTimeout()
 		{
-			ClientSocket.UpdateTimeout(_clientTimeout);
+			ClientSocket.UpdateTimeout(_clientTimeout * 1000);
 
-			ServerSocket.UpdateTimeout(_serverTimeout);
+			ServerSocket.UpdateTimeout(_serverTimeout * 1000);
 		}
 
 		private byte SanitizeChannel(byte channelId)
